@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-from .ingest import extract_chunks  # noqa: E402
+from .ingest import Chunk, extract_chunks  # noqa: E402
 from .llm import stream_answer  # noqa: E402
 from .store import DocumentStore  # noqa: E402
 
@@ -100,13 +101,31 @@ def _sse(event: str, data) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+BROAD_REQUEST = re.compile(
+    r"\b(summari[sz]e|summary|overview|tl;?dr|gist|outline|main (points|ideas|topics)|"
+    r"key (points|takeaways|ideas)|what (is|are) (this|these|it) about)\b",
+    re.IGNORECASE,
+)
+OVERVIEW_K = int(os.getenv("OVERVIEW_K", "12"))
+
+
+def retrieve(question: str) -> tuple[list[tuple[Chunk, float | None]], bool]:
+    """Keyword search, or an even spread of passages for broad requests and
+    questions whose words don't appear in the documents. Returns (hits, overview)."""
+    if not BROAD_REQUEST.search(question):
+        hits = store.search(question, k=TOP_K)
+        if hits:
+            return hits, False
+    return [(c, None) for c in store.overview(OVERVIEW_K)], True
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    hits = store.search(req.question, k=TOP_K)
+    hits, overview = retrieve(req.question)
     chunks = [c for c, _ in hits]
     sources = [
         {"id": i, "doc_id": c.doc_id, "doc_name": c.doc_name, "page": c.page,
-         "text": c.text, "score": round(s, 3)}
+         "text": c.text, "score": None if s is None else round(s, 3)}
         for i, (c, s) in enumerate(hits, start=1)
     ]
 
@@ -114,7 +133,7 @@ async def chat(req: ChatRequest):
         yield _sse("sources", sources)
         try:
             async for delta in stream_answer(
-                req.question, chunks, [t.model_dump() for t in req.history]
+                req.question, chunks, [t.model_dump() for t in req.history], overview
             ):
                 yield _sse("delta", delta)
         except anthropic.AuthenticationError:

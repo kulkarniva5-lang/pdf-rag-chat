@@ -1,0 +1,31 @@
+# ---- Stage 1: build the React frontend ---------------------------------------
+FROM node:20-alpine AS frontend
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Stage 2: Python backend that also serves the built frontend -------------
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DATA_DIR=/app/backend/data
+
+WORKDIR /app/backend
+COPY backend/requirements.txt ./
+RUN pip install -r requirements.txt
+
+COPY backend/app ./app
+# main.py looks for the build at ../frontend/dist relative to backend/
+COPY --from=frontend /app/frontend/dist /app/frontend/dist
+
+# Run as a non-root user
+RUN useradd --create-home appuser && mkdir -p "$DATA_DIR" && chown -R appuser /app
+USER appuser
+
+# Render (and most hosts) inject $PORT; default to 8000 locally.
+ENV PORT=8000
+EXPOSE 8000
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips='*'"]

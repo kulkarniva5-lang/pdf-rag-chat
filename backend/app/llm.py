@@ -40,11 +40,18 @@ def format_sources(chunks: list[Chunk]) -> str:
 
 
 async def stream_answer(
-    question: str, chunks: list[Chunk], history: list[dict]
+    question: str, chunks: list[Chunk], history: list[dict], overview: bool = False
 ) -> AsyncIterator[str]:
     """Yield answer text deltas."""
-    context = format_sources(chunks) if chunks else "(no matching excerpts were found)"
-    user_turn = f"<sources>\n{context}\n</sources>\n\nQuestion: {question}"
+    context = format_sources(chunks) if chunks else "(no documents have been uploaded)"
+    note = (
+        "\n\nNote: these excerpts are an even sample from across each document, not "
+        "search matches. When summarizing, work from them and say the summary is based "
+        "on sampled sections."
+        if overview and chunks
+        else ""
+    )
+    user_turn = f"<sources>\n{context}\n</sources>{note}\n\nQuestion: {question}"
 
     # Prior turns are kept as plain text (without their old sources) so follow-up
     # questions like "tell me more" still have conversational context.

@@ -79,6 +79,22 @@ class DocumentStore:
             return True
 
     # ---- retrieval ---------------------------------------------------------
+    def overview(self, k: int = 12) -> list[Chunk]:
+        """Pick chunks spread evenly through every document, for broad requests
+        ("summarize", "what is this about") that keyword search can't answer."""
+        by_doc: dict[str, list[Chunk]] = {}
+        for c in self.chunks:
+            by_doc.setdefault(c.doc_id, []).append(c)
+        if not by_doc:
+            return []
+        per_doc = max(1, k // len(by_doc))
+        picked: list[Chunk] = []
+        for chunks in by_doc.values():
+            n = min(per_doc, len(chunks))
+            step = len(chunks) / n
+            picked.extend(chunks[int(i * step)] for i in range(n))
+        return picked[: max(k, len(by_doc))]
+
     def search(self, query: str, k: int = 6) -> list[tuple[Chunk, float]]:
         bm25 = self._bm25
         if bm25 is None:

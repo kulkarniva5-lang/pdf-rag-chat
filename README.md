@@ -57,6 +57,26 @@ Then ask things like *"How many vacation days carry over?"* or *"When do install
 
 Run `npm run build` in `frontend/`, then start the backend alone: it serves the built app at http://localhost:8000.
 
+### Docker
+
+One container builds the React app and serves it from the Python backend:
+
+```bash
+docker build -t pdf-rag-chat .
+docker run -p 8000:8000 -e ANTHROPIC_API_KEY=sk-ant-... pdf-rag-chat
+```
+
+Open http://localhost:8000. The container listens on `$PORT` (default 8000), as most hosts expect.
+
+### Deploy to Render (free tier)
+
+1. On [render.com](https://render.com), choose **New → Web Service** and connect this repo.
+2. Runtime: **Docker**. Instance type: **Free**.
+3. Add the environment variable `ANTHROPIC_API_KEY`.
+4. Deploy.
+
+On the free tier the service sleeps after 15 minutes idle, and uploaded PDFs are lost on restart. The app has no authentication or rate limiting, so anyone with the URL can spend your API credits. Set a spend limit on your key in the Anthropic Console before sharing the link.
+
 ## Configuration
 
 Set these in `backend/.env`:
