@@ -10,8 +10,7 @@ RUN npm run build
 FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DATA_DIR=/app/backend/data
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app/backend
 COPY backend/requirements.txt ./
@@ -22,7 +21,7 @@ COPY backend/app ./app
 COPY --from=frontend /app/frontend/dist /app/frontend/dist
 
 # Run as a non-root user
-RUN useradd --create-home appuser && mkdir -p "$DATA_DIR" && chown -R appuser /app
+RUN useradd --create-home appuser && chown -R appuser /app
 USER appuser
 
 # Render (and most hosts) inject $PORT; default to 8000 locally.

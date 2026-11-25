@@ -145,6 +145,14 @@ export default function App() {
             </li>
           ))}
         </ul>
+
+        <footer className="sidebar-footer">
+          <p className="privacy">
+            Your PDFs are private to this tab and kept only in memory. They're deleted when you close the tab
+            or after 30 minutes of inactivity.
+          </p>
+          <p className="credit">Built by VK</p>
+        </footer>
       </aside>
 
       <main className="chat">

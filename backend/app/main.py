@@ -1,19 +1,24 @@
-"""FastAPI backend: upload PDFs, retrieve with BM25, stream grounded answers."""
+"""FastAPI backend: upload PDFs, retrieve with BM25, stream grounded answers.
+
+Documents are private to each browser session and held only in memory.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,15 +26,33 @@ load_dotenv()
 
 from .ingest import Chunk, extract_chunks  # noqa: E402
 from .llm import stream_answer  # noqa: E402
-from .store import DocumentStore  # noqa: E402
+from .store import DocumentStore, SessionManager  # noqa: E402
 
-DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[1] / "data"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 TOP_K = int(os.getenv("TOP_K", "6"))
+OVERVIEW_K = int(os.getenv("OVERVIEW_K", "12"))
+SESSION_TTL_MIN = float(os.getenv("SESSION_TTL_MIN", "30"))
 
-store = DocumentStore(DATA_DIR / "store.json")
-app = FastAPI(title="PDF RAG Chat")
+sessions = SessionManager(
+    ttl=SESSION_TTL_MIN * 60,
+    grace=15,  # seconds after tab close; a page reload within this keeps the data
+    max_sessions=int(os.getenv("MAX_SESSIONS", "200")),
+)
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    async def purge_loop():
+        while True:
+            await asyncio.sleep(5)
+            sessions.purge_expired()
+
+    task = asyncio.create_task(purge_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="PDF RAG Chat", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","),
@@ -37,15 +60,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_SESSION_ID = re.compile(r"^[A-Za-z0-9-]{16,64}$")
+
+
+def _check_session_id(session_id: str) -> str:
+    if not _SESSION_ID.match(session_id):
+        raise HTTPException(400, "Missing or invalid session id.")
+    return session_id
+
+
+def session_store(x_session_id: str = Header("")) -> DocumentStore:
+    return sessions.get(_check_session_id(x_session_id))
+
+
+# ---- session -----------------------------------------------------------------
+@app.post("/api/session/{session_id}/end", status_code=204)
+def end_session(session_id: str):
+    """Called by the browser (sendBeacon) when the tab is closed."""
+    sessions.end(_check_session_id(session_id))
+    return Response(status_code=204)
+
 
 # ---- documents ---------------------------------------------------------------
 @app.get("/api/documents")
-def list_documents():
+def list_documents(store: DocumentStore = Depends(session_store)):
     return sorted(store.documents.values(), key=lambda d: d["uploaded_at"], reverse=True)
 
 
 @app.post("/api/documents")
-async def upload_documents(files: list[UploadFile] = File(...)):
+async def upload_documents(
+    files: list[UploadFile] = File(...), store: DocumentStore = Depends(session_store)
+):
     added, errors = [], []
     for f in files:
         name = f.filename or "document.pdf"
@@ -80,7 +125,7 @@ async def upload_documents(files: list[UploadFile] = File(...)):
 
 
 @app.delete("/api/documents/{doc_id}")
-def delete_document(doc_id: str):
+def delete_document(doc_id: str, store: DocumentStore = Depends(session_store)):
     if not store.remove(doc_id):
         raise HTTPException(404, "Document not found")
     return {"ok": True}
@@ -106,10 +151,11 @@ BROAD_REQUEST = re.compile(
     r"key (points|takeaways|ideas)|what (is|are) (this|these|it) about)\b",
     re.IGNORECASE,
 )
-OVERVIEW_K = int(os.getenv("OVERVIEW_K", "12"))
 
 
-def retrieve(question: str) -> tuple[list[tuple[Chunk, float | None]], bool]:
+def retrieve(
+    store: DocumentStore, question: str
+) -> tuple[list[tuple[Chunk, float | None]], bool]:
     """Keyword search, or an even spread of passages for broad requests and
     questions whose words don't appear in the documents. Returns (hits, overview)."""
     if not BROAD_REQUEST.search(question):
@@ -120,8 +166,8 @@ def retrieve(question: str) -> tuple[list[tuple[Chunk, float | None]], bool]:
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
-    hits, overview = retrieve(req.question)
+async def chat(req: ChatRequest, store: DocumentStore = Depends(session_store)):
+    hits, overview = retrieve(store, req.question)
     chunks = [c for c, _ in hits]
     sources = [
         {"id": i, "doc_id": c.doc_id, "doc_name": c.doc_name, "page": c.page,
@@ -161,7 +207,7 @@ async def chat(req: ChatRequest):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "documents": len(store.documents), "chunks": len(store.chunks)}
+    return {"ok": True, "active_sessions": len(sessions)}
 
 
 # ---- serve the built React app in production ---------------------------------

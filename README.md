@@ -6,7 +6,7 @@ A small, readable retrieval-augmented generation (RAG) demo: upload PDFs, ask qu
 - **Backend:** Python + FastAPI. PDF text extraction (`pypdf`), page-aware chunking, BM25 retrieval (`rank-bm25`), and answers streamed from Claude over server-sent events.
 
 ```
- PDF ─► pypdf ─► page-aware chunks ─► BM25 index (JSON on disk)
+ PDF ─► pypdf ─► page-aware chunks ─► BM25 index (in memory, per session)
                                             │
  question ─────────────────► top-k chunks ──┘
                                    │
@@ -16,6 +16,16 @@ A small, readable retrieval-augmented generation (RAG) demo: upload PDFs, ask qu
                                    │
               answer with [n] citations ─► React UI ─► click [n] to see the passage
 ```
+
+## Privacy: per-session, in-memory data
+
+Each browser tab gets its own private workspace; visitors never see each other's documents. Nothing is written to disk: the original PDF is discarded after its text is extracted, and the chunks live only in memory. A session's data is deleted when:
+
+- the tab is closed (the page notifies the server; a reload within 15 seconds keeps the data),
+- it has been inactive for `SESSION_TTL_MIN` minutes (default 30), or
+- the server restarts.
+
+Questions and retrieved passages are sent to the Anthropic API to generate answers.
 
 ## Why BM25 instead of embeddings?
 
@@ -75,7 +85,7 @@ Open http://localhost:8000. The container listens on `$PORT` (default 8000), as 
 3. Add the environment variable `ANTHROPIC_API_KEY`.
 4. Deploy.
 
-On the free tier the service sleeps after 15 minutes idle, and uploaded PDFs are lost on restart. The app has no authentication or rate limiting, so anyone with the URL can spend your API credits. Set a spend limit on your key in the Anthropic Console before sharing the link.
+On the free tier the service sleeps after 15 minutes idle (which also clears all sessions). The app has no authentication or rate limiting, so anyone with the URL can spend your API credits. Set a spend limit on your key in the Anthropic Console before sharing the link.
 
 ## Configuration
 
@@ -87,17 +97,21 @@ Set these in `backend/.env`:
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Model used for answers |
 | `TOP_K` | `6` | Number of chunks retrieved per question |
 | `MAX_UPLOAD_MB` | `25` | Per-file upload limit |
-| `DATA_DIR` | `backend/data` | Where the index is stored |
+| `SESSION_TTL_MIN` | `30` | Minutes of inactivity before a session's documents are deleted |
+| `MAX_SESSIONS` | `200` | Concurrent sessions kept in memory (oldest evicted beyond this) |
 | `CORS_ORIGINS` | `http://localhost:5173` | Allowed origins (comma-separated) |
 
 ## API
 
 | Method | Path | Description |
 |---|---|---|
+| `POST` | `/api/session/{id}/end` | Mark a session closed (sent by the browser on tab close) |
 | `GET` | `/api/documents` | List indexed documents |
 | `POST` | `/api/documents` | Upload one or more PDFs (`multipart/form-data`, field `files`) |
 | `DELETE` | `/api/documents/{id}` | Remove a document and its chunks |
 | `POST` | `/api/chat` | `{question, history}` → SSE stream: `sources`, then `delta`s, then `done` |
+
+Every request except session end needs an `X-Session-Id` header (16-64 letters, digits or dashes); the frontend generates one per tab.
 
 ## Project layout
 
@@ -105,7 +119,7 @@ Set these in `backend/.env`:
 backend/app/
   main.py     FastAPI routes, SSE streaming, static hosting of the built UI
   ingest.py   PDF → cleaned text → overlapping chunks (never spanning pages)
-  store.py    JSON-persisted chunk store + BM25 search
+  store.py    Per-session in-memory chunk stores, BM25 search, session expiry
   llm.py      Grounded prompt + streaming call to Claude
 frontend/src/
   App.jsx     Upload sidebar, chat, citation chips, source viewer
@@ -117,7 +131,7 @@ scripts/
 ## Limitations
 
 - Scanned (image-only) PDFs have no extractable text; run OCR first.
-- The single-file JSON store is meant for demo-sized corpora (hundreds of pages).
+- Sessions live in one server process's memory, so this runs as a single instance and is meant for demo-sized corpora (hundreds of pages per session).
 - There is no authentication: don't expose it publicly as-is.
 
 ## License

@@ -1,17 +1,15 @@
-"""A tiny persistent document store with BM25 retrieval.
+"""In-memory, per-session document stores with BM25 retrieval.
 
-Everything lives in one JSON file, and the BM25 index is rebuilt in memory
-whenever the corpus changes. That is plenty for a demo-sized corpus (a few
-hundred pages); swap in a vector DB for anything bigger.
+Nothing is written to disk. Each browser session gets its own private store,
+which is deleted when the tab closes, after a period of inactivity, or when
+the server restarts.
 """
 
 from __future__ import annotations
 
-import json
 import re
 import threading
-from dataclasses import asdict
-from pathlib import Path
+import time
 
 from rank_bm25 import BM25Okapi
 
@@ -29,32 +27,13 @@ def tokenize(text: str) -> list[str]:
 
 
 class DocumentStore:
-    def __init__(self, path: Path):
-        self.path = path
+    """One session's documents and chunks, plus a BM25 index over them."""
+
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self.documents: dict[str, dict] = {}
         self.chunks: list[Chunk] = []
         self._bm25: BM25Okapi | None = None
-        self._load()
-
-    # ---- persistence -------------------------------------------------------
-    def _load(self) -> None:
-        if self.path.exists():
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self.documents = raw.get("documents", {})
-            self.chunks = [Chunk(**c) for c in raw.get("chunks", [])]
-        self._reindex()
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(
-                {"documents": self.documents, "chunks": [asdict(c) for c in self.chunks]}
-            ),
-            encoding="utf-8",
-        )
-        tmp.replace(self.path)
 
     def _reindex(self) -> None:
         corpus = [tokenize(c.text) for c in self.chunks]
@@ -66,7 +45,6 @@ class DocumentStore:
             self.documents[doc["id"]] = doc
             self.chunks.extend(chunks)
             self._reindex()
-            self._save()
 
     def remove(self, doc_id: str) -> bool:
         with self._lock:
@@ -75,7 +53,6 @@ class DocumentStore:
             del self.documents[doc_id]
             self.chunks = [c for c in self.chunks if c.doc_id != doc_id]
             self._reindex()
-            self._save()
             return True
 
     # ---- retrieval ---------------------------------------------------------
@@ -105,3 +82,48 @@ class DocumentStore:
         scores = bm25.get_scores(tokens)
         ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
         return [(self.chunks[i], float(scores[i])) for i in ranked[:k] if scores[i] > 0]
+
+
+class SessionManager:
+    """Maps session ids to stores and expires them.
+
+    Every request pushes a session's expiry out to `ttl` seconds. When the tab
+    closes, the browser calls `end()`, which shortens the expiry to `grace`
+    seconds; a page reload makes a new request within that window and keeps
+    the session alive.
+    """
+
+    def __init__(self, ttl: float, grace: float, max_sessions: int) -> None:
+        self.ttl, self.grace, self.max_sessions = ttl, grace, max_sessions
+        self._lock = threading.Lock()
+        self._sessions: dict[str, tuple[DocumentStore, float]] = {}
+
+    def get(self, session_id: str) -> DocumentStore:
+        now = time.monotonic()
+        with self._lock:
+            store = self._sessions.get(session_id, (None, 0))[0]
+            if store is None:
+                if len(self._sessions) >= self.max_sessions:
+                    # Evict the session closest to expiring to bound memory use.
+                    oldest = min(self._sessions, key=lambda s: self._sessions[s][1])
+                    del self._sessions[oldest]
+                store = DocumentStore()
+            self._sessions[session_id] = (store, now + self.ttl)
+            return store
+
+    def end(self, session_id: str) -> None:
+        with self._lock:
+            if session_id in self._sessions:
+                store, _ = self._sessions[session_id]
+                self._sessions[session_id] = (store, time.monotonic() + self.grace)
+
+    def purge_expired(self) -> int:
+        now = time.monotonic()
+        with self._lock:
+            expired = [s for s, (_, exp) in self._sessions.items() if exp <= now]
+            for s in expired:
+                del self._sessions[s]
+            return len(expired)
+
+    def __len__(self) -> int:
+        return len(self._sessions)
